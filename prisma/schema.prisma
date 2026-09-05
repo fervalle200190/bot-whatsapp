@@ -1,0 +1,140 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MerchantStatus {
+  PENDIENTE_CONEXION
+  ACTIVO
+  SUSPENDIDO
+}
+
+enum ProductSource {
+  EXTRACCION_FOTO
+  MANUAL_CHAT
+}
+
+enum ImportStatus {
+  EXTRAYENDO
+  ESPERANDO_CONFIRMACION
+  CONFIRMADO
+  DESCARTADO
+}
+
+enum Fulfillment {
+  RETIRO
+  DELIVERY
+}
+
+enum OrderStatus {
+  BORRADOR
+  ESPERANDO_PAGO
+  PAGO_EN_REVISION
+  APROBADA
+  RECHAZADA
+  CANCELADA
+}
+
+enum ProofDecision {
+  PENDIENTE
+  APROBADO
+  RECHAZADO
+}
+
+model Merchant {
+  id                 String         @id @default(cuid())
+  name               String
+  ownerPhone         String         @unique
+  status             MerchantStatus @default(PENDIENTE_CONEXION)
+
+  zavuInvitationId   String?        @unique
+  zavuSenderId       String?        @unique
+  zavuSenderWebhookSecret String?
+  zavuAgentId        String?        @unique
+
+  payoutInstructions String?
+  vesRate            Decimal?       @db.Decimal(18, 4)
+  vesRateUpdatedAt   DateTime?
+
+  products           Product[]
+  orders             Order[]
+  menuImports        MenuImport[]
+  createdAt          DateTime       @default(now())
+}
+
+model Product {
+  id          String        @id @default(cuid())
+  merchantId  String
+  merchant    Merchant      @relation(fields: [merchantId], references: [id])
+  name        String
+  description String?
+  priceUsd    Decimal       @db.Decimal(10, 2)
+  available   Boolean       @default(true)
+  source      ProductSource
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([merchantId, available])
+}
+
+model MenuImport {
+  id         String       @id @default(cuid())
+  merchantId String
+  merchant   Merchant     @relation(fields: [merchantId], references: [id])
+  sourceUrl  String
+  status     ImportStatus @default(EXTRAYENDO)
+  extracted  Json
+  model      String
+  createdAt  DateTime     @default(now())
+
+  @@index([merchantId, status])
+}
+
+model Order {
+  id                 String         @id @default(cuid())
+  merchantId         String
+  merchant           Merchant       @relation(fields: [merchantId], references: [id])
+  buyerPhone         String
+  buyerName          String?
+  status             OrderStatus    @default(BORRADOR)
+  fulfillment        Fulfillment?
+  deliveryLat        Decimal?       @db.Decimal(10, 7)
+  deliveryLng        Decimal?       @db.Decimal(10, 7)
+  totalUsd           Decimal?       @db.Decimal(10, 2)
+  totalVes           Decimal?       @db.Decimal(18, 2)
+  vesRateUsed        Decimal?       @db.Decimal(18, 4)
+  zavuConversationId String?
+  items              OrderItem[]
+  proofs             PaymentProof[]
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  @@index([merchantId, status])
+  @@index([merchantId, buyerPhone, status])
+}
+
+model OrderItem {
+  id           String  @id @default(cuid())
+  orderId      String
+  order        Order   @relation(fields: [orderId], references: [id])
+  productId    String
+  nameSnapshot String
+  unitPriceUsd Decimal @db.Decimal(10, 2)
+  qty          Int
+}
+
+model PaymentProof {
+  id            String        @id @default(cuid())
+  orderId       String
+  order         Order         @relation(fields: [orderId], references: [id])
+  imageUrl      String
+  zavuMessageId String
+  decision      ProofDecision @default(PENDIENTE)
+  decidedAt     DateTime?
+  merchantNote  String?
+  createdAt     DateTime      @default(now())
+}
