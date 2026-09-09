@@ -1,0 +1,212 @@
+{
+  "name": "agente-vendedor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "agente-vendedor",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "agente-vendedor",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "n8n-webhook-secret",
+          "name": "X-N8N-Secret"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "claude-opus-5",
+        "options": {}
+      },
+      "id": "anthropic-model",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1,
+      "position": [220, 200],
+      "credentials": {
+        "anthropicApi": {
+          "id": "anthropic-credential",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Webhook').item.json.body.merchantId }}:{{ $('Webhook').item.json.body.contactPhone }}",
+        "tableName": "n8n_chat_memory"
+      },
+      "id": "postgres-chat-memory",
+      "name": "Postgres Chat Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.1,
+      "position": [380, 200],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-n8n-db",
+          "name": "Postgres (n8n)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "toolDescription": "Busca productos disponibles del catálogo del comercio, filtrando opcionalmente por término.",
+        "url": "={{ $env.BACKEND_BASE_URL }}/tools/catalogo/buscar",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Tools-Secret", "value": "={{ $env.TOOLS_SHARED_SECRET }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"merchantId\": $('Webhook').item.json.body.merchantId, \"contactPhone\": $('Webhook').item.json.body.contactPhone, \"arguments\": $fromAI('arguments', 'termino opcional', 'json') } }}"
+      },
+      "id": "tool-buscar-productos",
+      "name": "buscar_productos",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [220, 380]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Agrega un producto al carrito del comprador (fusiona la cantidad si ya estaba).",
+        "url": "={{ $env.BACKEND_BASE_URL }}/tools/carrito/agregar",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Tools-Secret", "value": "={{ $env.TOOLS_SHARED_SECRET }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"merchantId\": $('Webhook').item.json.body.merchantId, \"contactPhone\": $('Webhook').item.json.body.contactPhone, \"arguments\": $fromAI('arguments', 'nombreProducto y cantidad', 'json') } }}"
+      },
+      "id": "tool-agregar-carrito",
+      "name": "agregar_al_carrito",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [360, 380]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Devuelve el carrito actual del comprador con sus totales en USD y Bs.",
+        "url": "={{ $env.BACKEND_BASE_URL }}/tools/carrito/ver",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Tools-Secret", "value": "={{ $env.TOOLS_SHARED_SECRET }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"merchantId\": $('Webhook').item.json.body.merchantId, \"contactPhone\": $('Webhook').item.json.body.contactPhone, \"arguments\": {} } }}"
+      },
+      "id": "tool-ver-carrito",
+      "name": "ver_carrito",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [500, 380]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Define el tipo de entrega del pedido: RETIRO o DELIVERY (con DELIVERY se le pide la ubicación al comprador).",
+        "url": "={{ $env.BACKEND_BASE_URL }}/tools/orden/entrega",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Tools-Secret", "value": "={{ $env.TOOLS_SHARED_SECRET }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"merchantId\": $('Webhook').item.json.body.merchantId, \"contactPhone\": $('Webhook').item.json.body.contactPhone, \"arguments\": $fromAI('arguments', 'tipo: retiro o delivery', 'json') } }}"
+      },
+      "id": "tool-definir-entrega",
+      "name": "definir_entrega",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [640, 380]
+    },
+    {
+      "parameters": {
+        "toolDescription": "Cierra la orden: congela los totales, pide el pago y envía los datos de cobro al comprador.",
+        "url": "={{ $env.BACKEND_BASE_URL }}/tools/orden/cerrar",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-Tools-Secret", "value": "={{ $env.TOOLS_SHARED_SECRET }}" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"merchantId\": $('Webhook').item.json.body.merchantId, \"contactPhone\": $('Webhook').item.json.body.contactPhone, \"arguments\": {} } }}"
+      },
+      "id": "tool-cerrar-orden",
+      "name": "cerrar_orden",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [780, 380]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.body.text }}",
+        "options": {
+          "systemMessage": "={{ $json.body.systemPrompt }}"
+        }
+      },
+      "id": "ai-agent",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"reply\": $json.output } }}"
+      },
+      "id": "respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [440, 0]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "AI Agent", "type": "main", "index": 0 }]]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [[{ "node": "AI Agent", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "Postgres Chat Memory": {
+      "ai_memory": [[{ "node": "AI Agent", "type": "ai_memory", "index": 0 }]]
+    },
+    "buscar_productos": {
+      "ai_tool": [[{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]]
+    },
+    "agregar_al_carrito": {
+      "ai_tool": [[{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]]
+    },
+    "ver_carrito": {
+      "ai_tool": [[{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]]
+    },
+    "definir_entrega": {
+      "ai_tool": [[{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]]
+    },
+    "cerrar_orden": {
+      "ai_tool": [[{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]]
+    },
+    "AI Agent": {
+      "main": [[{ "node": "Respond to Webhook", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
