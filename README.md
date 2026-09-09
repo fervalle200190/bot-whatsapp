@@ -1,133 +1,245 @@
-# Zavu MVP — Ventas por WhatsApp multi-tenant
+# Backend WhatsApp multi-tenant
 
-MVP para validar que un comercio puede inscribirse apretando un botón, cargar su menú con una foto y vender por WhatsApp con un agente de IA, dejando cada pago en una cola de aprobación manual.
+Backend en **NestJS + TypeORM**, corriendo sobre **Bun**, con Postgres y Swagger/OpenAPI autogenerado. El canal de WhatsApp es la **Cloud API de Meta**, directa, con la conversación de venta delegada a un workflow de **n8n** self-hosted, y una **API de panel** para que el comercio administre sus pedidos, tasa y datos de cobro.
 
-Spec completa: [specs/01-mvp-ventas-whatsapp-multitenant.md](specs/01-mvp-ventas-whatsapp-multitenant.md) — léela primero si necesitás el porqué de las decisiones, no solo el qué.
+> **Estado actual:** SPEC 02 (núcleo de negocio) + SPEC 03 (canal Meta + n8n)
+> + SPEC 04 (API del panel) implementados. El SPA del panel vive en otro
+> repo, con su propio spec. El alta manual de comercios llega en el **SPEC 05**.
 
----
+## Requisitos
 
-## 1. Requisitos
+- [Bun](https://bun.sh) ≥ 1.1
+- Docker + Docker Compose (para Postgres y n8n)
 
-- Node 20+
-- pnpm
-- Docker (para Postgres local)
-- Una cuenta de [Zavu](https://zavu.dev) con API key
-- Una API key de Anthropic
-
----
-
-## 2. Poner el proyecto a andar en local (sin WhatsApp real todavía)
-
-Esto te deja el server corriendo y la base migrada. Sirve para tocar el código, correr los tests, y probar los endpoints de tools "a mano" con curl — pero **sin** un WhatsApp real conectado, porque eso requiere los pasos de la sección 3.
+## Puesta en marcha
 
 ```bash
-pnpm install
-docker compose up -d
-cp .env.example .env
+docker compose up -d   # Postgres + n8n
+bun install
+cp .env.example .env   # completá los secretos
+bun run migration:run  # o dejá que NODE_ENV=development sincronice el esquema solo
+bun run seed
+bun run start:dev
 ```
 
-Completá `.env` con al menos:
-- `ZAVU_API_KEY` (real, aunque sea de una cuenta de prueba)
-- `ANTHROPIC_API_KEY` (real)
-- El resto de las variables (`ZAVU_OPERATOR_SENDER_ID`, `ZAVU_OPERATOR_WEBHOOK_SECRET`, `ZAVU_TOOLS_WEBHOOK_SECRET`, `ZAVU_PAGO_EN_REVISION_TEMPLATE_ID`) podés dejarlas con cualquier valor no vacío por ahora — se completan de verdad en la sección 3.
+- `GET http://localhost:3000/health` → `{ "status": "ok" }`
+- `GET http://localhost:3000/docs` → Swagger UI con `/tools/*`, `/registro` y `/api/*`
+- `GET http://localhost:3000/registro` → formulario de alta de comercio
+- `http://localhost:5678` → n8n (crear el usuario dueño la primera vez)
+
+En un volumen de Postgres **nuevo**, `docker/postgres-init/01-create-n8n-db.sql`
+crea la base `n8n` sola. Si el volumen ya existía antes de este spec (por
+ejemplo, en un entorno de desarrollo que arrancó con el SPEC 02), creála a mano una vez:
 
 ```bash
-pnpm exec prisma migrate dev --name init
-pnpm prisma:seed
-pnpm dev
+docker compose exec postgres psql -U postgres -c "CREATE DATABASE n8n"
 ```
 
-Verificá que levantó:
+## Variables de entorno
+
+Ver `.env.example`. Resumen:
+
+| Variable | Qué es |
+| --- | --- |
+| `NODE_ENV` | `development` sincroniza el esquema automáticamente; `production` requiere migraciones |
+| `PORT` | Puerto HTTP (default `3000`) |
+| `PUBLIC_BASE_URL` | URL pública del backend |
+| `DATABASE_URL` | Conexión a Postgres (`bot_whatsapp`) |
+| `TOOLS_SHARED_SECRET` | Secreto compartido por todas las tools de venta (`X-Tools-Secret`) |
+| `META_GRAPH_VERSION` | Versión de la Graph API de Meta (p. ej. `v21.0`) |
+| `META_ACCESS_TOKEN` | Token permanente de system user de la WABA |
+| `META_APP_SECRET` | Para verificar `X-Hub-Signature-256` en los webhooks |
+| `META_VERIFY_TOKEN` | El del `GET` de suscripción del webhook en Meta |
+| `N8N_WEBHOOK_BASE_URL` | Base del webhook de n8n (p. ej. `http://localhost:5678/webhook`) |
+| `N8N_WEBHOOK_SECRET` | Header que el backend manda a n8n y que el workflow exige |
+| `PANEL_ORIGIN` | Origen exacto del SPA del panel, para CORS (`http://localhost:5173` en dev) |
+
+Arrancar sin cualquiera de estas variables falla al inicio con un mensaje que
+nombra la variable faltante (`ConfigModule` + `class-validator`).
+`ANTHROPIC_API_KEY` **no** se carga en el backend: es una credencial dentro de n8n.
+
+## Base de datos
+
+- **Desarrollo** (`NODE_ENV=development`, default): TypeORM sincroniza el
+  esquema automáticamente a partir de las entidades.
+- **Producción** (`NODE_ENV=production`): el esquema se aplica solo con
+  migraciones versionadas en `src/database/migrations/`.
 
 ```bash
-curl http://localhost:3000/health
-# {"status":"ok"}
+bun run migration:generate -- src/database/migrations/NombreDelCambio
+bun run migration:run
+bun run migration:revert
 ```
 
-Corré la suite de tests (necesita Postgres arriba, por el test de aislamiento del paso 20):
+`bun run seed` crea (upsert por `ownerPhone`, idempotente) el comercio
+"Arepas La Esquina" con tres productos, tasa, datos de cobro, un
+`metaPhoneNumberId` ficticio y un `panelToken` fijo para probar el panel en local:
+
+```
+Authorization: Bearer seed_panel_token_local_only
+```
+
+## Tools de venta (`POST /tools/*`)
+
+Protegidas por el header `X-Tools-Secret: {TOOLS_SHARED_SECRET}`. La
+identidad de quien llama (`merchantId`, `contactPhone`) va en el body —
+**nunca** la pone el modelo, solo `arguments`:
+
+```jsonc
+// POST /tools/catalogo/buscar
+{ "merchantId": "...", "contactPhone": "+58...", "arguments": { "termino": "arepa" } }
+```
+
+| Ruta | Qué hace |
+| --- | --- |
+| `POST /tools/catalogo/buscar` | Catálogo disponible del comercio, filtrado por término opcional |
+| `POST /tools/carrito/agregar` | Agrega un producto al carrito (fusiona cantidad si ya estaba) |
+| `POST /tools/carrito/ver` | Snapshot del carrito con totales en USD/Bs |
+| `POST /tools/orden/entrega` | Define `RETIRO`/`DELIVERY`; con `DELIVERY` pide ubicación |
+| `POST /tools/orden/cerrar` | Congela totales, pasa a `ESPERANDO_PAGO`, envía datos de cobro |
+
+Un `arguments` inválido para la tool responde `200 { "error": "argumentos_invalidos" }`
+(no `400`): la única clienta es n8n y necesita poder explicarle el error al
+comprador. Un `merchantId`/`contactPhone` faltante sí responde `400`.
+
+Sin `X-Tools-Secret` correcto → `401`.
+
+## Canal de WhatsApp: Meta Cloud API + n8n
+
+Una sola WhatsApp Business Account nuestra: cada comercio se identifica por
+el `phone_number_id` que Meta manda en cada evento (`Merchant.metaPhoneNumberId`).
+
+- `GET /webhooks/meta` — challenge de verificación de Meta (`hub.verify_token`).
+- `POST /webhooks/meta` — eventos entrantes, protegidos por `MetaSignatureGuard`
+  (`X-Hub-Signature-256` contra el body crudo). Responde `200` de inmediato;
+  el procesamiento sigue en segundo plano. Un `phone_number_id` desconocido
+  se ignora con `200`. El mismo `messageId` recibido dos veces se procesa una
+  sola vez (`DedupeService`, TTL corto en memoria).
+- Texto del comprador → `N8nAgentService.ask(...)` (workflow de n8n) → la
+  respuesta se envía por `MetaMessagingService.sendText`.
+- Ubicación compartida → se guarda en la orden `BORRADOR` con `DELIVERY` del
+  comprador.
+- Imagen con una orden en `ESPERANDO_PAGO` → se crea el `PaymentProof`
+  (referenciando el `mediaId` de Meta, no una URL: las de Meta expiran), la
+  orden pasa a `PAGO_EN_REVISION` y se le acusa recibo al comprador. Nadie
+  más recibe aviso — el comercio lo ve en el panel.
+
+### Poner en marcha n8n
+
+1. Abrí `http://localhost:5678` y creá el usuario dueño.
+2. Cargá una credencial **Anthropic** con tu `ANTHROPIC_API_KEY`.
+3. Cargá una credencial **Postgres** apuntando a la misma base `n8n` del
+   `docker-compose.yml`, para la memoria de chat.
+4. Cargá una credencial **Header Auth** para el nodo Webhook: header
+   `X-N8N-Secret`, valor = tu `N8N_WEBHOOK_SECRET`.
+5. Importá `n8n/workflows/agente-vendedor.json` desde la UI (Import from File).
+6. En los nodos HTTP Request de las tools, las expresiones usan
+   `$env.BACKEND_BASE_URL` y `$env.TOOLS_SHARED_SECRET`: definilas como
+   variables de entorno del contenedor de n8n (o reemplazalas por los
+   valores fijos de tu entorno al importar).
+7. Activá el workflow.
+
+> El JSON del workflow se versiona tal cual se exporta desde la UI; los tipos
+> de nodo de n8n cambian de versión en versión, así que si algo no importa
+> limpio, es más rápido rehacer el nodo en la UI y reexportar que pelearse
+> con el JSON a mano.
+
+### Contrato backend → n8n
+
+```jsonc
+// POST {N8N_WEBHOOK_BASE_URL}/agente-vendedor   Header: X-N8N-Secret
+{ "merchantId": "...", "contactPhone": "+58...", "text": "...", "systemPrompt": "..." }
+// 200 → { "reply": "..." }
+```
+
+El prompt del vendedor vive en [`src/messaging/prompts.ts`](src/messaging/prompts.ts)
+y viaja en cada llamada; el workflow no tiene texto de negocio.
+
+## API del panel del comercio (`/api/*`)
+
+Pensada para que la consuma un SPA en otro repo. Autenticada por link
+secreto permanente (`Merchant.panelToken`), como `Authorization: Bearer <token>`.
+CORS restringido a `PANEL_ORIGIN`. El contrato completo (DTOs de request y
+response) está publicado en `/docs`.
+
+| Ruta | Qué hace |
+| --- | --- |
+| `GET /api/me` | Datos del comercio del token |
+| `GET /api/ordenes?desde=<ISO>` | Pedidos en `PAGO_EN_REVISION`/`APROBADA`/`RECHAZADA`, con ítems, totales y comprobante; `desde` filtra por `updatedAt` para el polling del SPA (cada 10s) |
+| `GET /api/ordenes/:id/comprobante` | La imagen del comprobante, descargada de Meta al momento (`MetaMessagingService.downloadMedia`) |
+| `POST /api/ordenes/:id/aceptar` | Aprueba pago y pedido en una sola decisión; avisa al comprador por WhatsApp |
+| `POST /api/ordenes/:id/rechazar` | Rechaza; avisa al comprador |
+| `PUT /api/tasa` | Actualiza `vesRate` del comercio del token |
+| `PUT /api/cobro` | Actualiza `payoutInstructions` del comercio del token |
+| `POST /api/token/regenerar` | El token viejo deja de servir al instante |
+
+- Sin `Authorization` o con un token inexistente → `401`.
+- `aceptar`/`rechazar` fuera de `PAGO_EN_REVISION` → `409`; con el token de
+  otro comercio (pedido ajeno) → `404`. Ninguno de los dos cambia nada.
+- El aviso al comprador usa `safeSend`: si Meta falla o está fuera de la
+  ventana de 24h, se loguea pero la decisión queda aplicada igual.
+- `OrderDecisionService.decideOrder` es un servicio puro (sin acoplarse a
+  HTTP) — orden + comprobante se actualizan en una sola transacción.
+
+## Arquitectura de módulos
+
+```
+src/
+  main.ts                bootstrap, ValidationPipe global, rawBody (para el guard de Meta), CORS, Swagger en /docs
+  app.module.ts
+  config/                validación de variables de entorno
+  database/              TypeORM data-source (CLI), migrations/, seed
+  common/                id (cuid2), transformer numeric ↔ number, safeSend
+  merchants/              Merchant + MerchantsService
+  catalog/                Product, MenuImport + CatalogService
+  orders/                 Order, OrderItem, PaymentProof + CartService + OrdersService + OrderDecisionService
+  tools/                  ToolsController, guard de secreto, DTOs
+  registro/               RegistroController (HTML)
+  messaging/              MessagingPort, VendorInboundService, DedupeService, prompts, MessagingModule
+  meta/                   MetaMessagingService, MetaSignatureGuard, MetaPayloadParser, WebhooksController
+  n8n/                    N8nAgentService
+  panel/                  PanelController, PanelTokenGuard, PanelTokenService, order.serializer, DTOs
+  health/
+n8n/
+  workflows/agente-vendedor.json
+docker/
+  postgres-init/          crea la base `n8n` en un volumen nuevo
+test/
+  orders/cart.service.spec.ts
+  orders/orders.service.spec.ts
+  tools/tools.isolation.spec.ts         ← contra Postgres real
+  meta/meta-signature.guard.spec.ts
+  meta/meta-payload.parser.spec.ts
+  meta/meta-messaging.service.spec.ts   ← fetch mockeado
+  n8n/n8n-agent.service.spec.ts         ← fetch mockeado
+  messaging/vendor-inbound.service.spec.ts
+  panel/api.isolation.spec.ts           ← contra Postgres real
+```
+
+`NoopMessagingService` (SPEC 02) sigue en el repo — sirve para tests y para
+correr sin credenciales de Meta — pero ya no es el provider activo de
+`MessagingPort`; `MetaMessagingService` lo reemplazó.
+
+## Tests
 
 ```bash
-pnpm test
-pnpm typecheck
-pnpm build
+bun test
 ```
 
----
+Los dos tests de aislamiento (`tools/tools.isolation.spec.ts` y
+`panel/api.isolation.spec.ts`) corren contra Postgres real, sin mockear la
+base: dos comercios con datos cruzados; fallan si cualquier ruta devuelve o
+modifica algo de otro `merchantId`. Sí mockean `fetch` global para no llamar
+a Meta de verdad.
 
-## 3. Conectar un WhatsApp real (necesario para probar el flujo completo)
+## Lo que no está en este spec
 
-Nada de esto se pudo probar en el desarrollo de este MVP por no tener una cuenta de Zavu real ni un WhatsApp Business conectado — son los pasos que hacen falta correr una sola vez, en orden, antes de que un comercio de verdad pueda usar esto.
-
-### 3.1. Exponer tu servidor a internet
-
-Zavu necesita mandarte webhooks por HTTPS. En desarrollo, usá un túnel (ej. `ngrok http 3000`) y poné esa URL en `PUBLIC_BASE_URL` de tu `.env`. En producción, es la URL real de tu deploy.
-
-### 3.2. Crear el número operador (100% manual, no hay API para esto)
-
-1. Entrá al [dashboard de Zavu](https://dashboard.zavu.dev).
-2. Creá un sender nuevo.
-3. En ese sender, andá a **Channels → WhatsApp → Add → Use my own phone number**, y conectá un número que pueda recibir SMS y que no esté ya en WhatsApp/WhatsApp Business.
-4. Copiá el `senderId` de ese sender y ponelo en `ZAVU_OPERATOR_SENDER_ID` en `.env`.
-
-### 3.3. Terminar de configurar el operador (esto sí es automatizable)
-
-Con el servidor corriendo y `PUBLIC_BASE_URL` apuntando a tu túnel/deploy:
-
-```bash
-pnpm exec tsx scripts/setup-operador.ts
-```
-
-Esto configura el webhook del sender operador, genera su secreto, crea el agente de IA del operador, y crea sus 4 tools (`identificar_comercio`, `confirmar_menu`, `editar_producto`, `actualizar_tasa`, `guardar_datos_cobro`). El script imprime el secreto nuevo — pegalo en `ZAVU_OPERATOR_WEBHOOK_SECRET` y reiniciá el server.
-
-### 3.4. Crear y enviar a aprobación la plantilla de WhatsApp
-
-```bash
-pnpm exec tsx scripts/setup-template-pago-en-revision.ts
-```
-
-Pegá el `id` que imprime en `ZAVU_PAGO_EN_REVISION_TEMPLATE_ID`. La plantilla queda en estado `pending` — **la aprobación de Meta puede tardar horas o días**. Hasta que Meta la apruebe, avisar a un comercio fuera de la ventana de 24h (paso 19 del spec) va a fallar; dentro de la ventana funciona igual sin depender de la plantilla.
-
-### 3.5. Probar el alta de un comercio real
-
-1. Abrí `PUBLIC_BASE_URL/registro` en el navegador.
-2. Completá nombre del comercio y tu WhatsApp real.
-3. Te va a redirigir al embedded signup de Meta — conectá un WhatsApp Business real de prueba (puede ser un número de prueba de Meta si tenés uno, o cualquier número que puedas usar para testear).
-4. Al completarse, el webhook `invitation.status_changed` activa el comercio: crea su agente vendedor y sus tools de venta (`buscar_productos`, `agregar_al_carrito`, `ver_carrito`, `definir_entrega`, `cerrar_orden`) automáticamente — no hay que correr nada a mano para esto.
-
-A partir de acá, escribile al número operador (para cargar menú/tasa/cobro) y al número del comercio recién conectado (para probar la venta) desde WhatsApp de verdad.
-
----
-
-## 4. Qué está probado y qué falta probar en vivo
-
-Todo el código pasa `pnpm typecheck`, `pnpm test` (30 tests) y `pnpm build`. Durante el desarrollo se verificó en vivo, contra Postgres real y HTTP real (sin mocks), lo siguiente:
-
-- Firma de webhooks (válida/inválida, por sender y por tool) — pasos 4, 8, 14, 16, 18.
-- Alta de un `Merchant` y manejo de fallos externos sin dejar filas huérfanas — paso 5.
-- Extracción, confirmación y corrección del menú, con el catálogo final correcto en Postgres — pasos 9, 10.
-- Tasa Bs/USD y datos de cobro — paso 11.
-- Catálogo, carrito y aislamiento entre dos comercios reales corriendo en paralelo — pasos 12, 13, 20.
-- Entrega (retiro/delivery) y guardado de coordenadas — paso 14.
-- Cierre de orden con congelamiento de totales (incluida la prueba de que cambiar la tasa después no mueve una orden ya cerrada) — paso 15.
-- Comprobante de pago y cola de revisión — pasos 16, 17.
-- Decisión Aprobar/Rechazar, **incluida la verificación de que solo el dueño de esa orden puntual puede decidir sobre ella** — paso 18.
-- Que ningún log exponga `ZAVU_API_KEY`, `ANTHROPIC_API_KEY`, ni los secretos de webhook.
-
-### Lo que NO se pudo probar en este entorno (sin cuenta de Zavu ni WhatsApp reales)
-
-No es una falla de la implementación: son pasos que necesitan credenciales reales que este entorno de desarrollo no tenía. Quedaron verificados por lógica y tests unitarios con mocks, pero no de punta a punta:
-
-- **Que el agente vendedor realmente responda un saludo** al escribirle al número de un comercio recién conectado (paso 7). El código que lo crea está probado; la respuesta real del agente de IA de Zavu no.
-- **Que el embedded signup de Meta funcione tal cual** — se probó el flujo hasta la llamada a `invitations.create`, que rechazó la API key de prueba con un error real de Zavu (`401 Invalid API key format`), confirmando que el código llega bien hasta ahí.
-- **La extracción real de un menú fotografiado** con Claude — la lógica está probada con mocks; nunca se le mandó una foto real a la API de Anthropic desde este flujo.
-- **La entrega real de mensajes de WhatsApp** (saludos, resúmenes de carrito, pedido de ubicación, aviso de comprobante, botones Aprobar/Rechazar, confirmaciones al comprador) — todas estas llamadas a `messages.send` se probaron hasta el punto de fallar contra la API real de Zavu con la key de prueba; el contenido exacto de cada mensaje está confirmado por tests unitarios, pero ninguna llegó de verdad a un WhatsApp.
-- **La aprobación real de Meta de la plantilla `pago_en_revision`** — depende de Meta, puede tardar días, y no hay forma de apurarla ni simularla.
-- **El fallback de ventana de 24h** (paso 19) — la heurística que decide si la ventana está abierta o cerrada (`conversations.list`) nunca se ejecutó contra datos reales; quedó documentada como limitación conocida en el spec (sección 6).
-- **Reenvío automático de los botones Aprobar/Rechazar** cuando la ventana estaba cerrada y el comercio responde a la plantilla — deliberadamente no se construyó (ver spec, decisión en sección 6); hoy hay que aprobar/rechazar manualmente si esto pasa.
-
-### Cómo terminar de validar esto
-
-1. Seguí la sección 3 de este README con una cuenta de Zavu real.
-2. Conectá dos comercios de prueba (dos WhatsApp Business distintos) para volver a probar el aislamiento multi-tenant con tráfico real, no solo con el test automatizado.
-3. Hacé una compra de punta a punta: cargar menú por foto → confirmar → comprar → elegir delivery → compartir ubicación → cerrar orden → mandar comprobante → aprobar desde el número operador.
-4. Mirá los logs del server mientras lo hacés — todo queda registrado con `req.log`, incluidos los `error` cuando algo externo falla.
+- El SPA del panel (repo separado, spec propio).
+- Menú: carga, extracción, edición — decisión explícita del usuario.
+- Alta manual de comercios y su número, entrega del QR del panel (**SPEC 05**).
+- Avisos al dueño por WhatsApp, email o push fuera del panel.
+- Pedidos en `BORRADOR`/`ESPERANDO_PAGO` en el panel; cancelaciones,
+  reembolsos, multiusuario, roles, auditoría, rate limiting del token.
+- Embedded signup, más de 20 comercios, alta disponibilidad de n8n, exponer n8n a internet.
+- Extracción de menú con IA, operador, integración con el proveedor de
+  mensajería anterior: no se portan.
